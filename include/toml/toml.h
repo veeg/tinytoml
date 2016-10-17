@@ -36,6 +36,7 @@ template<typename T> struct call_traits_value {
 template<typename T> struct call_traits_ref {
     typedef const T& return_type;
 };
+class Writer;
 } // namespace internal
 
 template<typename T> struct call_traits;
@@ -54,10 +55,25 @@ template<typename T> struct call_traits<std::vector<T>> : public internal::call_
 
 // Formatting flags
 enum FormatFlag {
-    FORMAT_NONE = 0,
-    FORMAT_INDENT = 1
+    FORMAT_NONE = (0ull << 0),
+    FORMAT_INDENT = (1ull << 1),
+    FORMAT_RECURSIVE = (1ull << 2),
+    FORMAT_TABLE_INLINE = (1ull << 8),
+    FORMAT_ARRAY_MULTILINE = (1ull << 10),
+    FORMAT_NUMERIC_UNDERSCORE = (1ull << 16),
+    FORMAT_DOUBLE_FRACTIONAL = (1ull << 17),
+    FORMAT_DOUBLE_EXPONENTIAL = (1ull << 18),
+    FORMAT_STRING_LITERAL = (1ull << 24),
+    FORMAT_STRING_LITERAL_MULTILINE = (1ull << 25),
 };
 
+#define TINYTOML_FORMAT_FLAGS_TABLE (toml::FORMAT_TABLE_INLINE)
+#define TINYTOML_FORMAT_FLAGS_ARRAY (toml::FORMAT_ARRAY_MULTILINE)
+#define TINYTOML_FORMAT_FLAGS_STRING (toml::FORMAT_STRING_LITERAL | \
+                                      toml::FORMAT_STRING_LITERAL_MULTILINE)
+#define TINYTOML_FORMAT_FLAGS_DOUBLE (toml::FORMAT_DOUBLE_FRACTIONAL | \
+                                      toml::FORMAT_DOUBLE_EXPONENTIAL | \
+                                      toml::FORMAT_NUMERIC_UNDERSCORE)
 class Value {
 public:
     enum Type {
@@ -165,16 +181,18 @@ public:
     Value* push(Value&& v);
 
     // ----------------------------------------------------------------------
-    // Others
+    // Writer related
 
-    // Writer.
-    static std::string spaces(int num);
-    static std::string escapeKey(const std::string& key);
+    bool setFormatFlags(enum FormatFlag flags);
 
+    // For backwards compatability. This method only invokes the writeFormatted.
+    //  KeyPrefix is discarded. indent determines if FORMAT_INDENT is used.
     void write(std::ostream*, const std::string& keyPrefix = std::string(), int indent = -1) const;
     void writeFormatted(std::ostream*, FormatFlag flags) const;
 
+    // Equivalent of invoking writeFormatted(v, FORMAT_NONE);
     friend std::ostream& operator<<(std::ostream&, const Value&);
+    friend class internal::Writer;
 
 private:
     static const char* typeToString(Type);
@@ -195,6 +213,7 @@ private:
         Array* array_;
         Table* table_;
     };
+    unsigned long long format_ = FORMAT_NONE;
 
     template<typename T> friend struct ValueConverter;
 };
@@ -346,6 +365,37 @@ private:
     Lexer lexer_;
     Token token_;
     std::string errorReason_;
+};
+
+class Writer {
+    const int indentIncrement = 2;
+public:
+    explicit Writer(std::ostream& os) : output_(os) { };
+
+    // Main write method
+    bool write(const Value& value, FormatFlag global);
+
+    // Utility methods
+    static std::string spaces(int num);
+    static std::string escapeKey(const std::string& key);
+    static std::string escapeString(const std::string& s);
+    static bool tableContainsKeyval(const Value& value);
+
+private:
+    std::ostream& output_;
+    bool writingTableInline_ = false;
+    int writingTableCurrentIndex_ = 0;
+    int indent_ = 0;
+    std::string separator_ = std::string("\n");
+    FormatFlag globalFormatOptions_;
+
+    // Writer methods that modify Writer state
+    void writeType(const Value& value);
+    void writeTable(const Value& value, const std::string& key);
+    void writeTableWithoutKey(const Value& value, const std::string& keyPrefix);
+    void writeTableCatagorizedLexicographical(const Value& value, const std::string& key);
+    void writeDatetime(const Value& value);
+    void writeArray(const Value& value);
 };
 
 } // namespace internal
@@ -525,24 +575,7 @@ inline bool isDouble(const std::string& s)
     return p == s.size();
 }
 
-// static
-inline std::string escapeString(const std::string& s)
-{
-    std::stringstream ss;
-    for (size_t i = 0; i < s.size(); ++i) {
-        switch (s[i]) {
-        case '\n': ss << "\\n"; break;
-        case '\r': ss << "\\r"; break;
-        case '\t': ss << "\\t"; break;
-        case '\"': ss << "\\\""; break;
-        case '\'': ss << "\\\'"; break;
-        case '\\': ss << "\\\\"; break;
-        default: ss << s[i]; break;
-        }
-    }
 
-    return ss.str();
-}
 
 } // namespace internal
 
@@ -1207,130 +1240,67 @@ inline std::time_t Value::as_time_t() const
     return std::chrono::system_clock::to_time_t(as<Time>());
 }
 
-inline std::string Value::spaces(int num)
+// For backwards compatability
+inline void Value::write(std::ostream* os, const std::string& _, int indent) const
 {
-    if (num <= 0)
-        return std::string();
-
-    return std::string(num, ' ');
-}
-
-inline std::string Value::escapeKey(const std::string& key)
-{
-    auto position = std::find_if(key.begin(), key.end(), [](char c) -> bool {
-        if (std::isalnum(c))
-            return false;
-        if (c != '_' && c == '-')
-            return false;
-        return true;
-    });
-
-    if (position != key.end()) {
-        std::string escaped = "\"";
-        for (const char& c : key) {
-            if (c == '\\' || c  == '"')
-                escaped += '\\';
-            escaped += c;
-        }
-        escaped += "\"";
-
-        return escaped;
-    }
-
-    return key;
-}
-
-inline void Value::write(std::ostream* os, const std::string& keyPrefix, int indent) const
-{
-    switch (type_) {
-    case NULL_TYPE:
-        failwith("null type value is not a valid value");
-        break;
-    case BOOL_TYPE:
-        (*os) << (bool_ ? "true" : "false");
-        break;
-    case INT_TYPE:
-        (*os) << int_;
-        break;
-    case DOUBLE_TYPE: {
-        (*os) << std::fixed << std::showpoint << double_;
-        break;
-    }
-    case STRING_TYPE:
-        (*os) << '"' << internal::escapeString(*string_) << '"';
-        break;
-    case TIME_TYPE: {
-        time_t tt = std::chrono::system_clock::to_time_t(*time_);
-        std::tm t;
-        gmtime_r(&tt, &t);
-        char buf[256];
-        sprintf(buf, "%04d-%02d-%02dT%02d:%02d:%02dZ", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
-        (*os) << buf;
-        break;
-    }
-    case ARRAY_TYPE:
-        (*os) << '[';
-        for (size_t i = 0; i < array_->size(); ++i) {
-            if (i)
-                (*os) << ", ";
-            (*array_)[i].write(os, keyPrefix, -1);
-        }
-        (*os) << ']';
-        break;
-    case TABLE_TYPE:
-        for (const auto& kv : *table_) {
-            if (kv.second.is<Table>())
-                continue;
-            if (kv.second.is<Array>() && kv.second.size() > 0 && kv.second.find(0)->is<Table>())
-                continue;
-            (*os) << spaces(indent) << escapeKey(kv.first) << " = ";
-            kv.second.write(os, keyPrefix, indent >= 0 ? indent + 1 : indent);
-            (*os) << '\n';
-        }
-        for (const auto& kv : *table_) {
-            if (kv.second.is<Table>()) {
-                std::string key(keyPrefix);
-                if (!keyPrefix.empty())
-                    key += ".";
-                key += escapeKey(kv.first);
-                (*os) << "\n" << spaces(indent) << "[" << key << "]\n";
-                kv.second.write(os, key, indent >= 0 ? indent + 1 : indent);
-            }
-            if (kv.second.is<Array>() && kv.second.size() > 0 && kv.second.find(0)->is<Table>()) {
-                std::string key(keyPrefix);
-                if (!keyPrefix.empty())
-                    key += ".";
-                key += escapeKey(kv.first);
-                for (const auto& v : kv.second.as<Array>()) {
-                    (*os) << "\n" << spaces(indent) << "[[" << key << "]]\n";
-                    v.write(os, key, indent >= 0 ? indent + 1 : indent);
-                }
-            }
-        }
-        break;
-    default:
-        failwith("writing unknown type");
-        break;
-    }
+    writeFormatted(os, (indent == -1 ? FORMAT_NONE : FORMAT_INDENT));
 }
 
 inline void Value::writeFormatted(std::ostream* os, FormatFlag flags) const
 {
-    int indent = flags & FORMAT_INDENT ? 0 : -1;
+    internal::Writer writer(*os);
 
-    write(os, std::string(), indent);
+    writer.write(*this, flags);
+}
+
+inline bool Value::setFormatFlags(enum FormatFlag flags)
+{
+    // Only allow flags for this type
+    switch (type()) {
+    case Value::Type::NULL_TYPE:
+        return false;
+    case Value::Type::BOOL_TYPE:
+        return false;
+    case Value::Type::INT_TYPE:
+        return false;
+    case Value::Type::DOUBLE_TYPE:
+        if (flags & ~TINYTOML_FORMAT_FLAGS_DOUBLE)
+            return false;
+        break;
+    case Value::Type::STRING_TYPE:
+        if (flags & ~TINYTOML_FORMAT_FLAGS_STRING)
+            return false;
+        break;
+    case Value::Type::TIME_TYPE:
+        return false;
+    case Value::Type::ARRAY_TYPE:
+        if (flags & ~TINYTOML_FORMAT_FLAGS_ARRAY)
+            return false;
+        break;
+    case Value::Type::TABLE_TYPE:
+        if (flags & ~TINYTOML_FORMAT_FLAGS_TABLE)
+            return false;
+        break;
+    default:
+        failwith("unknown type");
+        return false;
+    }
+
+    format_ = static_cast<unsigned long long>(flags);
+    return true;
 }
 
 // static
 inline FormatFlag operator|(FormatFlag lhs, FormatFlag rhs)
 {
-    return static_cast<FormatFlag>(static_cast<int>(lhs) | static_cast<int>(rhs));
+    return static_cast<FormatFlag>(static_cast<unsigned long long>(lhs) |
+                                   static_cast<unsigned long long>(rhs));
 }
 
 // static
 inline std::ostream& operator<<(std::ostream& os, const toml::Value& v)
 {
-    v.write(&os);
+    v.writeFormatted(&os, FORMAT_NONE);
     return os;
 }
 
@@ -1959,6 +1929,339 @@ inline bool Parser::parseInlineTable(Value* value)
 }
 
 } // namespace internal
+
+//-------------------------------------
+// Writer
+namespace internal {
+
+inline bool Writer::write(const Value& value, FormatFlag global)
+{
+    if (value.type_ != Value::TABLE_TYPE)
+        failwith("cannot write non-table value");
+
+    // TODO Store global flags in class
+    globalFormatOptions_ = global;
+
+    if (tableContainsKeyval(value))
+        indent_ = -indentIncrement;
+
+    writeType(value);
+
+    indent_ = 0;
+    separator_ = "\n";
+    writingTableCurrentIndex_ = 0;
+    writingTableInline_ = false;
+    // TODO: Clear internal writer state.
+    //
+    return true;
+}
+
+// static
+inline std::string Writer::spaces(int num)
+{
+    if (num <= 0)
+        return std::string();
+
+    return std::string(num, ' ');
+}
+
+// static
+inline std::string Writer::escapeKey(const std::string& key)
+{
+    auto position = std::find_if(key.begin(), key.end(), [](char c) -> bool {
+        if (std::isalnum(c))
+            return false;
+        if (c != '_' && c == '-')
+            return false;
+        return true;
+    });
+
+    if (position != key.end()) {
+        std::string escaped = "\"";
+        for (const char& c : key) {
+            if (c == '\\' || c  == '"')
+                escaped += '\\';
+            escaped += c;
+        }
+        escaped += "\"";
+
+        return escaped;
+    }
+
+    return key;
+}
+
+// static
+inline std::string Writer::escapeString(const std::string& s)
+{
+    std::stringstream ss;
+    for (size_t i = 0; i < s.size(); ++i) {
+        switch (s[i]) {
+        case '\n': ss << "\\n"; break;
+        case '\r': ss << "\\r"; break;
+        case '\t': ss << "\\t"; break;
+        case '\"': ss << "\\\""; break;
+        case '\'': ss << "\\\'"; break;
+        case '\\': ss << "\\\\"; break;
+        default: ss << s[i]; break;
+        }
+    }
+
+    return ss.str();
+}
+
+// static
+// Determine if the input Value table contains any keys that are not Table
+inline bool Writer::tableContainsKeyval(const Value& value)
+{
+    if (value.type_ != Value::TABLE_TYPE)
+        failwith("value not table");
+
+    for (const auto& kv: *(value.table_)) {
+        if (kv.second.is<Table>())
+            continue;
+        // Table contains non-table
+        return true;
+    }
+
+    // Table contains only tables (or nothing)
+    return false;
+}
+
+inline void Writer::writeDatetime(const Value& value)
+{
+    time_t tt = std::chrono::system_clock::to_time_t(*(value.time_));
+    std::tm t;
+    gmtime_r(&tt, &t);
+    char buf[256];
+    sprintf(buf, "%04d-%02d-%02dT%02d:%02d:%02dZ", t.tm_year + 1900, t.tm_mon + 1,
+                                                   t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+    output_ << buf;
+}
+
+inline void Writer::writeArray(const Value& value)
+{
+    // TODO: Differantiante on inline and multiline formatting options.
+    output_ << '[';
+    for (size_t i = 0; i < value.array_->size(); ++i) {
+        if (i)
+            output_ << ", ";
+        writeType((*value.array_)[i]);
+    }
+    output_ << ']';
+}
+
+// Write the table out in Catagorixed, Lexicographical order
+// Keyvals are written first, than arrays/tables
+inline void Writer::writeTableCatagorizedLexicographical(const Value& value, const std::string& keyPrefix)
+{
+    // Write keyvals in leicographical order first.
+    for (const auto& kv : *value.table_) {
+        if (kv.second.is<Table>())
+            continue;
+        if (kv.second.is<Array>() && kv.second.size() > 0 && kv.second.find(0)->is<Table>())
+            continue;
+
+        if (writingTableCurrentIndex_ > 0)
+            output_ << separator_;
+
+        if (writingTableInline_ == false)
+            output_ << spaces(indent_);
+
+        output_ << escapeKey(kv.first) << " = ";
+        writeType(kv.second);
+        writingTableCurrentIndex_ += 1;
+    }
+
+    // Write table and array elements
+    for (const auto& kv : *(value.table_)) {
+        // Write table
+        if (kv.second.is<Table>()) {
+            std::string key(keyPrefix);
+            if (!keyPrefix.empty())
+                key += ".";
+            key += escapeKey(kv.first);
+
+            writeTable(kv.second, key);
+
+            output_ << separator_;
+            writingTableCurrentIndex_ += 1;
+        }
+
+        // Write array of tables
+        // Peak at the first entry. If its a table, than we assume the entire array is to spec.
+        if (kv.second.is<Array>() && kv.second.size() > 0 && kv.second.find(0)->is<Table>()) {
+            std::string key(keyPrefix);
+            if (!keyPrefix.empty())
+                key += ".";
+            key += escapeKey(kv.first);
+
+            // XXX: What to we do if inline inline table is requested?
+            // This probably doesnt make sense. We should maybe just write the table as normal
+            if (writingTableInline_)
+                failwith("cannot write table inline that has array of tables");
+
+            int entryIndent = indent_;
+            for (const auto& v : kv.second.as<Array>()) {
+                if (writingTableCurrentIndex_ > 0)
+                    output_ << "\n\n";
+
+                output_ << spaces(indent_);
+                output_ << "[[" << key << "]]\n";
+
+                if (tableContainsKeyval(v) == false)
+                    indent_ += indentIncrement;
+
+                writeTableWithoutKey(v, key);
+
+                // Restore indent at entry
+                indent_ = entryIndent;
+            }
+
+            output_ << separator_;
+            writingTableCurrentIndex_ += 1;
+        }
+    }
+}
+
+// Write the table without the key formatting trouble
+inline void Writer::writeTableWithoutKey(const Value& value, const std::string& keyPrefix)
+{
+    // Prepare state for table function
+    writingTableCurrentIndex_ = 0;
+    // Only indent if we actually wrote the key last pass
+    // XXX How is this for inline?
+    if (tableContainsKeyval(value))
+        indent_ += indentIncrement;
+
+    // TODO: Invoke different write methods based on format options
+    writeTableCatagorizedLexicographical(value, keyPrefix);
+}
+
+// Write the table, taking formatting options into consideration
+// The key is passed down from above, being the key of this table.
+// An empty key means we are writing the root table.
+inline void Writer::writeTable(const Value& value, const std::string& key)
+{
+    bool entryWritingInline = writingTableInline_;
+    int entryTableCurrentIndex = writingTableCurrentIndex_;;
+    int entryIndent = indent_;
+    std::string pre("\n");
+    std::string post("");
+
+    bool hasKeyvals = tableContainsKeyval(value);
+
+    // We may write this inline if we are not root, and the FORMAT_TABLE_INLINE option is
+    // set either on the global options or on the value specific formatting options.
+    if (key.empty() == false &&
+            (globalFormatOptions_ & FORMAT_TABLE_INLINE ||
+             value.format_ & FORMAT_TABLE_INLINE ||
+             entryWritingInline))
+    {
+        writingTableInline_ = true;
+        pre = " = { ";
+        post = " }";
+        separator_ = ", ";
+    }
+
+    // If we are the first entry, (and we are not inline) we should buffer one newline above us.
+    // Not applicable to root entry.
+    if (key.empty() == false && writingTableInline_ == false &&
+        writingTableCurrentIndex_ != 0 && hasKeyvals)
+    {
+        output_ << separator_;
+    }
+
+    // Write the table key. Skip writing non-inline key for a table that only contains sub-tables
+    // Not applicable to root entry.
+    if (key.empty() == false &&
+        ((writingTableInline_ == false && hasKeyvals) || writingTableInline_))
+    {
+        if (writingTableInline_ == false)
+        {
+            output_ << spaces(indent_);
+            output_ << "[";
+        }
+
+        // The key must already be escaped.
+        output_ << key;
+
+        if (writingTableInline_ == false)
+            output_ << "]\n";
+    }
+
+    if (writingTableInline_)
+        output_ << pre;
+
+    // Write a separator between the previous inline table element and this element
+    if (writingTableInline_ && writingTableCurrentIndex_ > 0)
+        output_ << separator_;
+
+    // This will determine what formatting algorithm to use
+    writeTableWithoutKey(value, key);
+
+    if (writingTableInline_)
+        output_ << post;
+
+    // Clear writingInline state if this was the table call invoking inline
+    if (entryWritingInline == false && writingTableInline_)
+    {
+        writingTableInline_ = false;
+        separator_ = "\n";
+        // Output one more separator entry to terminate the inline statement
+        output_ << separator_;
+    }
+
+    // Restore entry variables
+    writingTableCurrentIndex_ = entryTableCurrentIndex;;
+    indent_ = entryIndent;
+}
+
+//! Evaluate the type and invoke the correct, format specific write function
+inline void Writer::writeType(const Value& value)
+{
+    switch (value.type_) {
+        case Value::NULL_TYPE:
+        failwith("null type value is not a valid value");
+        break;
+    case Value::BOOL_TYPE:
+        // Inline bool type. Not much to do wrong.
+        output_ << (value.bool_ ? "true" : "false");
+        break;
+    case Value::INT_TYPE:
+        // Inline integer type.
+        // Can extract out in separate method if integer output is specified by format.
+        output_ << value.int_;
+        break;
+    case Value::DOUBLE_TYPE: {
+        // Inline float type.
+        // Can extract out in separate method if float output is specified by format.
+        output_ << std::fixed << std::showpoint << value.double_;
+        break;
+    }
+    case Value::STRING_TYPE:
+        // Inline string type.
+        // Can extract out in separate method if string output is specified by format.
+        output_ << '"' << escapeString(*value.string_) << '"';
+        break;
+    case Value::TIME_TYPE:
+        writeDatetime(value);
+        break;
+    case Value::ARRAY_TYPE:
+        writeArray(value);
+        break;
+    case Value::TABLE_TYPE:
+        // writeType should only be invoked on a root table. Use writeTable() instead
+        writeTable(value, std::string());
+        break;
+    default:
+        failwith("writing unknown type");
+        break;
+    }
+}
+
+} // namespace internal
+
 } // namespace toml
 
 #endif // TINYTOML_H_
